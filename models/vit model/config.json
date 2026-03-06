@@ -1,0 +1,48 @@
+{
+  "architectures": [
+    "ViTForImageClassification"
+  ],
+  "attention_probs_dropout_prob": 0.0,
+  "dtype": "float32",
+  "encoder_stride": 16,
+  "hidden_act": "gelu",
+  "hidden_dropout_prob": 0.0,
+  "hidden_size": 768,
+  "id2label": {
+    "0": "dog",
+    "1": "horse",
+    "2": "elephant",
+    "3": "butterfly",
+    "4": "chicken",
+    "5": "cat",
+    "6": "cow",
+    "7": "sheep",
+    "8": "spider",
+    "9": "squirrel"
+  },
+  "image_size": 224,
+  "initializer_range": 0.02,
+  "intermediate_size": 3072,
+  "label2id": {
+    "dog": 0,
+    "horse": 1,
+    "elephant": 2,
+    "butterfly": 3,
+    "chicken": 4,
+    "cat": 5,
+    "cow": 6,
+    "sheep": 7,
+    "spider": 8,
+    "squirrel": 9
+  },
+  "layer_norm_eps": 1e-12,
+  "model_type": "vit",
+  "num_attention_heads": 12,
+  "num_channels": 3,
+  "num_hidden_layers": 12,
+  "patch_size": 16,
+  "pooler_act": "tanh",
+  "pooler_output_size": 768,
+  "qkv_bias": true,
+  "transformers_version": "5.0.0"
+}

@@ -1,0 +1,21 @@
+services:
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: cnn-transfer-learning-app
+    ports:
+      - "5000:5000"
+    environment:
+      FLASK_DEBUG: "0"
+      # The app discovers all models under this root.
+      MODELS_ROOT: /app/model-store
+      # Optional default selected model ID in dropdown.
+      MODEL_ID: hf-vit-model
+    volumes:
+      # Mount multiple model directories for extensibility.
+      - "./models/vit model:/app/model-store/vit-model:ro"
+      - "./models/animals10_efficientnetv2s.h5:/app/model-store/animals10_efficientnetv2s.h5:ro"
+      - ./models/experiment-a:/app/model-store/experiment-a:ro
+      - ./models/experiment-b:/app/model-store/experiment-b:ro
+    restart: unless-stopped
