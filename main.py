@@ -8,6 +8,7 @@ import numpy as np
 from flask import Flask, render_template, request
 from PIL import Image
 from werkzeug.utils import secure_filename
+from model_cache import ModelCacheManager
 
 app = Flask(__name__)
 app.config["MAX_CONTENT_LENGTH"] = 8 * 1024 * 1024  # 8 MB
@@ -15,8 +16,10 @@ app.config["MAX_CONTENT_LENGTH"] = 8 * 1024 * 1024  # 8 MB
 MODELS_ROOT = Path(os.getenv("MODELS_ROOT", "models"))
 DEFAULT_MODEL_ID = os.getenv("MODEL_ID", "")
 ALLOWED_EXTENSIONS = {"png", "jpg", "jpeg", "webp"}
+CACHE_TTL_SECONDS = int(os.getenv("MODEL_CACHE_TTL_SECONDS", "300"))
+PREDICTION_IMAGE_SIZE = 224
 
-_model_cache: dict[str, dict[str, Any]] = {}
+cache_manager = ModelCacheManager(ttl_seconds=CACHE_TTL_SECONDS)
 
 
 def _slugify(value: str) -> str:
@@ -48,31 +51,35 @@ def discover_models() -> list[dict[str, str]]:
             }
         )
 
-    # Keras .h5 models
-    for h5_path in sorted(MODELS_ROOT.glob("**/*.h5")):
-        resolved_h5 = h5_path
+    # Keras models: support both .h5 and .keras files
+    keras_candidates = sorted(MODELS_ROOT.glob("**/*.h5")) + sorted(MODELS_ROOT.glob("**/*.keras"))
+    for keras_path in keras_candidates:
+        resolved_keras = keras_path
 
         # Some exports create a directory ending with .h5 containing the real file.
-        if h5_path.is_dir():
-            nested = h5_path / h5_path.name
+        if keras_path.is_dir() and keras_path.suffix == ".h5":
+            nested = keras_path / keras_path.name
             if nested.exists() and nested.is_file() and nested.suffix == ".h5":
-                resolved_h5 = nested
+                resolved_keras = nested
             else:
                 # Ignore .h5 directories that do not contain a valid model file.
                 continue
 
         # Keep only actual files after resolution.
-        if not resolved_h5.is_file():
+        if not resolved_keras.is_file():
             continue
 
-        rel = resolved_h5.relative_to(MODELS_ROOT)
+        rel = resolved_keras.relative_to(MODELS_ROOT)
         model_id = _slugify(f"keras-{rel.as_posix()}")
+        display_name = f"{resolved_keras.stem} (Keras)"
+        if resolved_keras.parent.name.lower() == "convnext" and resolved_keras.stem.lower() == "model":
+            display_name = "ConvNext"
         models.append(
             {
                 "id": model_id,
-                "name": f"{resolved_h5.stem} (Keras)",
+                "name": display_name,
                 "kind": "keras",
-                "path": str(resolved_h5),
+                "path": str(resolved_keras),
             }
         )
 
@@ -87,7 +94,7 @@ def get_selected_model(model_id: str | None = None) -> tuple[dict[str, str], lis
     models = discover_models()
     if not models:
         raise FileNotFoundError(
-            f"No models found under '{MODELS_ROOT}'. Add a ViT folder or .h5 model file."
+            f"No models found under '{MODELS_ROOT}'. Add a ViT folder, .h5 model, or .keras model file."
         )
 
     selected_id = model_id or DEFAULT_MODEL_ID
@@ -120,9 +127,11 @@ def load_class_names_for_transformer(model_dir: Path) -> list[str]:
 
 
 def get_transformer_bundle(model_meta: dict[str, str]) -> dict[str, Any]:
+    cache_manager.purge_stale_model_cache()
     cache_key = model_meta["id"]
-    if cache_key in _model_cache:
-        return _model_cache[cache_key]
+    cached = cache_manager.get_cached_bundle(cache_key)
+    if cached is not None:
+        return cached
 
     model_dir = Path(model_meta["path"])
     if not model_dir.exists():
@@ -145,25 +154,63 @@ def get_transformer_bundle(model_meta: dict[str, str]) -> dict[str, Any]:
         "processor": processor,
         "class_names": load_class_names_for_transformer(model_dir),
     }
-    _model_cache[cache_key] = bundle
-    return bundle
+    return cache_manager.store_cached_bundle(cache_key, bundle)
 
 
 def _load_keras_class_names(h5_path: Path, output_size: int) -> list[str]:
+    # ConvNeXt export convention: model folder contains label_map.json.
+    label_map_file = h5_path.parent / "label_map.json"
+    if label_map_file.exists():
+        with label_map_file.open("r", encoding="utf-8") as f:
+            label_map = json.load(f)
+
+        index_to_label = label_map.get("index_to_label")
+        if isinstance(index_to_label, dict) and index_to_label:
+            try:
+                ordered = sorted(index_to_label.items(), key=lambda x: int(x[0]))
+                labels = [str(v) for _, v in ordered]
+                if labels:
+                    return labels
+            except Exception:
+                pass
+
     labels_file = h5_path.with_suffix(".labels.json")
     if labels_file.exists():
         with labels_file.open("r", encoding="utf-8") as f:
             labels = json.load(f)
         if isinstance(labels, list) and labels:
             return [str(x) for x in labels]
+        if isinstance(labels, dict) and labels:
+            try:
+                ordered = sorted(labels.items(), key=lambda x: int(x[0]))
+                return [str(v) for _, v in ordered]
+            except Exception:
+                pass
 
+    # Alternate convention: a generic labels file in the model folder.
+    alt_labels_file = h5_path.parent / "labels.json"
+    if alt_labels_file.exists():
+        with alt_labels_file.open("r", encoding="utf-8") as f:
+            labels = json.load(f)
+        if isinstance(labels, list) and labels:
+            return [str(x) for x in labels]
+        if isinstance(labels, dict) and labels:
+            try:
+                ordered = sorted(labels.items(), key=lambda x: int(x[0]))
+                return [str(v) for _, v in ordered]
+            except Exception:
+                pass
+
+    # Fallback to neutral class names when no explicit labels are available.
     return [f"Class_{idx}" for idx in range(output_size)]
 
 
 def get_keras_bundle(model_meta: dict[str, str]) -> dict[str, Any]:
+    cache_manager.purge_stale_model_cache()
     cache_key = model_meta["id"]
-    if cache_key in _model_cache:
-        return _model_cache[cache_key]
+    cached = cache_manager.get_cached_bundle(cache_key)
+    if cached is not None:
+        return cached
 
     h5_path = Path(model_meta["path"])
     if not h5_path.exists():
@@ -187,8 +234,7 @@ def get_keras_bundle(model_meta: dict[str, str]) -> dict[str, Any]:
         "model": model,
         "class_names": _load_keras_class_names(h5_path, max(output_size, 1)),
     }
-    _model_cache[cache_key] = bundle
-    return bundle
+    return cache_manager.store_cached_bundle(cache_key, bundle)
 
 
 def get_model_bundle(model_meta: dict[str, str]) -> dict[str, Any]:
@@ -201,7 +247,7 @@ def get_model_bundle(model_meta: dict[str, str]) -> dict[str, Any]:
 
 def preprocess_image(file_storage):
     img = Image.open(file_storage.stream).convert("RGB")
-    return img
+    return img.resize((PREDICTION_IMAGE_SIZE, PREDICTION_IMAGE_SIZE))
 
 
 def build_image_preview(file_storage) -> str | None:
@@ -230,7 +276,6 @@ def _ensure_probability_vector(raw_output: np.ndarray) -> np.ndarray:
         arr = exps / np.sum(exps)
     return arr
 
-
 def _predict_transformer(bundle: dict[str, Any], image: Image.Image) -> np.ndarray:
     try:
         import torch
@@ -248,14 +293,7 @@ def _predict_transformer(bundle: dict[str, Any], image: Image.Image) -> np.ndarr
 
 def _predict_keras(bundle: dict[str, Any], image: Image.Image) -> np.ndarray:
     model = bundle["model"]
-    input_shape = getattr(model, "input_shape", None)
-    target_h, target_w = 224, 224
-    if input_shape and len(input_shape) >= 3:
-        target_h = int(input_shape[1] or 224)
-        target_w = int(input_shape[2] or 224)
-
-    image_resized = image.resize((target_w, target_h))
-    arr = np.array(image_resized, dtype=np.float32) / 255.0
+    arr = np.array(image, dtype=np.float32) / 255.0
     arr = np.expand_dims(arr, axis=0)
     raw = model.predict(arr, verbose=0)[0]
     return _ensure_probability_vector(raw)
@@ -273,13 +311,15 @@ def run_prediction(file_storage, model_meta: dict[str, str]):
 
     top_idx = int(np.argmax(probabilities))
     top_confidence = float(probabilities[top_idx])
-    top_label = class_names[top_idx] if top_idx < len(class_names) else f"Class {top_idx}"
+    raw_top_label = class_names[top_idx] if top_idx < len(class_names) else f"Class {top_idx}"
+    top_label = raw_top_label
 
     top3_idx = np.argsort(probabilities)[-3:][::-1]
     top3 = []
     for idx in top3_idx:
-        class_name = class_names[int(idx)] if int(idx) < len(class_names) else f"Class {int(idx)}"
-        top3.append({"label": class_name, "confidence": round(float(probabilities[int(idx)]) * 100, 2)})
+        raw_class_name = class_names[int(idx)] if int(idx) < len(class_names) else f"Class {int(idx)}"
+        # class_name = to_meaningful_label_text(raw_class_name)
+        top3.append({"label": raw_class_name, "confidence": round(float(probabilities[int(idx)]) * 100, 2)})
 
     return {
         "label": top_label,
@@ -298,6 +338,7 @@ def get_feedback_mood(confidence: float) -> str:
 
 @app.route("/", methods=["GET"])
 def home():
+    cache_manager.purge_stale_model_cache()
     selected = request.args.get("model_id")
     selected_model, models = get_selected_model(selected)
     return render_template("index.html", models=models, selected_model_id=selected_model["id"])
@@ -305,6 +346,7 @@ def home():
 
 @app.route("/predict", methods=["POST"])
 def predict():
+    cache_manager.purge_stale_model_cache()
     result = None
     error = None
     uploaded_name = None
@@ -353,4 +395,4 @@ def predict():
 
 if __name__ == "__main__":
     debug_mode = os.getenv("FLASK_DEBUG", "0") == "1"
-    app.run(host="0.0.0.0", port=5000, debug=debug_mode)
+    app.run(host="0.0.0.0", port=5001, debug=debug_mode)
