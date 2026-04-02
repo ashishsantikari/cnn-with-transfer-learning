@@ -21,6 +21,7 @@ _model_cache: dict[str, dict[str, Any]] = {}
 
 
 def _slugify(value: str) -> str:
+    # Turn discovered paths into stable, URL-safe model IDs for form values.
     safe_chars = "abcdefghijklmnopqrstuvwxyz0123456789-"
     lowered = value.lower().replace(" ", "-").replace("_", "-")
     slug = "".join(ch for ch in lowered if ch in safe_chars)
@@ -103,6 +104,7 @@ def get_selected_model(model_id: str | None = None) -> tuple[dict[str, str], lis
 
 
 def allowed_file(filename: str) -> bool:
+    # Only allow image formats the UI advertises and the app expects.
     return "." in filename and filename.rsplit(".", 1)[1].lower() in ALLOWED_EXTENSIONS
 
 
@@ -199,6 +201,7 @@ def get_keras_bundle(model_meta: dict[str, str]) -> dict[str, Any]:
 
 
 def get_model_bundle(model_meta: dict[str, str]) -> dict[str, Any]:
+    # Dispatch lazy loading based on the model type discovered from disk.
     if model_meta["kind"] == "transformers":
         return get_transformer_bundle(model_meta)
     if model_meta["kind"] == "keras":
@@ -250,6 +253,7 @@ def _predict_transformer(bundle: dict[str, Any], image: Image.Image) -> np.ndarr
 
     model = bundle["model"]
     processor = bundle["processor"]
+    # Let the Hugging Face processor handle resizing, normalization, and tensor conversion.
     inputs = processor(images=image, return_tensors="pt")
     with torch.no_grad():
         outputs = model(**inputs)
@@ -288,6 +292,7 @@ def run_prediction(file_storage, model_meta: dict[str, str]):
     top_confidence = float(probabilities[top_idx])
     top_label = class_names[top_idx] if top_idx < len(class_names) else f"Class {top_idx}"
 
+    # Build a small ranked summary for the result page instead of returning raw vectors.
     top3_idx = np.argsort(probabilities)[-3:][::-1]
     top3 = []
     for idx in top3_idx:
@@ -312,6 +317,7 @@ def get_feedback_mood(confidence: float) -> str:
 
 @app.route("/", methods=["GET"])
 def home():
+    # Preserve the current model selection when the user comes back from the result page.
     selected = request.args.get("model_id")
     selected_model, models = get_selected_model(selected)
     return render_template("index.html", models=models, selected_model_id=selected_model["id"])
@@ -330,6 +336,7 @@ def predict():
     selected_model_id = request.form.get("model_id", "")
 
     try:
+        # Resolve the requested model before validating the upload so the page can re-render correctly.
         selected_model, models = get_selected_model(selected_model_id)
     except Exception as exc:
         error = str(exc)
@@ -349,6 +356,7 @@ def predict():
             # Surface inference problems in the UI instead of returning a raw server error.
             error = f"Prediction failed: {exc}"
 
+    # Default to the error/sad state unless a successful prediction upgrades the mood.
     mood = "oops"
     if result:
         mood = get_feedback_mood(result["confidence"])
@@ -367,5 +375,6 @@ def predict():
 
 
 if __name__ == "__main__":
+    # Keep local debugging opt-in so the container/dev server can use the same entry point.
     debug_mode = os.getenv("FLASK_DEBUG", "0") == "1"
     app.run(host="0.0.0.0", port=5000, debug=debug_mode)
