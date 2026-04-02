@@ -127,7 +127,7 @@ Example:
 FLASK_DEBUG=1 MODELS_ROOT=models MODEL_ID=hf-vit-model python main.py
 ```
 
-## Run With Docker Compose
+### 1. Hugging Face vision models
 
 Build and run:
 

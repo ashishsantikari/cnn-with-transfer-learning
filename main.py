@@ -16,6 +16,7 @@ MODELS_ROOT = Path(os.getenv("MODELS_ROOT", "models"))
 DEFAULT_MODEL_ID = os.getenv("MODEL_ID", "")
 ALLOWED_EXTENSIONS = {"png", "jpg", "jpeg", "webp"}
 
+# Cache loaded model bundles so repeat predictions avoid reloading weights from disk.
 _model_cache: dict[str, dict[str, Any]] = {}
 
 
@@ -31,7 +32,7 @@ def discover_models() -> list[dict[str, str]]:
     if not MODELS_ROOT.exists():
         return models
 
-    # Hugging Face-style model folders (config + safetensors)
+    # Discover Hugging Face-style image classification exports.
     for config_path in sorted(MODELS_ROOT.glob("**/config.json")):
         model_dir = config_path.parent
         weights_path = model_dir / "model.safetensors"
@@ -48,7 +49,7 @@ def discover_models() -> list[dict[str, str]]:
             }
         )
 
-    # Keras .h5 models
+    # Discover single-file Keras exports as well as odd directory-based .h5 exports.
     for h5_path in sorted(MODELS_ROOT.glob("**/*.h5")):
         resolved_h5 = h5_path
 
@@ -76,7 +77,7 @@ def discover_models() -> list[dict[str, str]]:
             }
         )
 
-    # Deduplicate in case of path collisions.
+    # Keep the last discovered entry for any duplicate generated IDs.
     dedup: dict[str, dict[str, str]] = {}
     for item in models:
         dedup[item["id"]] = item
@@ -90,12 +91,14 @@ def get_selected_model(model_id: str | None = None) -> tuple[dict[str, str], lis
             f"No models found under '{MODELS_ROOT}'. Add a ViT folder or .h5 model file."
         )
 
+    # Respect explicit form/query selection first, then fall back to env config.
     selected_id = model_id or DEFAULT_MODEL_ID
     if selected_id:
         for item in models:
             if item["id"] == selected_id:
                 return item, models
 
+    # Default to the first discovered model so the UI always has a valid selection.
     return models[0], models
 
 
@@ -115,6 +118,7 @@ def load_class_names_for_transformer(model_dir: Path) -> list[str]:
     if not id2label:
         return []
 
+    # Normalize labels into index order because configs store keys as strings.
     sorted_items = sorted(id2label.items(), key=lambda x: int(x[0]))
     return [label for _, label in sorted_items]
 
@@ -139,6 +143,7 @@ def get_transformer_bundle(model_meta: dict[str, str]) -> dict[str, Any]:
     processor = AutoImageProcessor.from_pretrained(str(model_dir))
     model.eval()
 
+    # Bundle runtime objects and metadata into one cached record.
     bundle = {
         "kind": "transformers",
         "model": model,
@@ -157,6 +162,7 @@ def _load_keras_class_names(h5_path: Path, output_size: int) -> list[str]:
         if isinstance(labels, list) and labels:
             return [str(x) for x in labels]
 
+    # Fall back to synthetic labels when the export has no sidecar metadata.
     return [f"Class_{idx}" for idx in range(output_size)]
 
 
@@ -182,6 +188,7 @@ def get_keras_bundle(model_meta: dict[str, str]) -> dict[str, Any]:
         output_shape = output_shape[0]
     output_size = int(output_shape[-1]) if output_shape and output_shape[-1] else 1
 
+    # Infer label count from the output layer when no explicit labels file is present.
     bundle = {
         "kind": "keras",
         "model": model,
@@ -200,6 +207,7 @@ def get_model_bundle(model_meta: dict[str, str]) -> dict[str, Any]:
 
 
 def preprocess_image(file_storage):
+    # Convert every upload to RGB so both backends receive a predictable image format.
     img = Image.open(file_storage.stream).convert("RGB")
     return img
 
@@ -211,6 +219,7 @@ def build_image_preview(file_storage) -> str | None:
     if not raw_bytes:
         return None
 
+    # Inline the uploaded image as a data URL so the result page needs no temp files.
     mime_type = file_storage.mimetype or "image/jpeg"
     encoded = base64.b64encode(raw_bytes).decode("ascii")
     return f"data:{mime_type};base64,{encoded}"
@@ -221,10 +230,12 @@ def _ensure_probability_vector(raw_output: np.ndarray) -> np.ndarray:
     if arr.size == 0:
         raise RuntimeError("Model returned empty prediction output.")
 
+    # Treat a single scalar as a binary-class confidence and synthesize the complement.
     if arr.size == 1:
         p1 = float(np.clip(arr[0], 0.0, 1.0))
         return np.array([1.0 - p1, p1], dtype=np.float32)
 
+    # Convert logits into probabilities when the model output is not already normalized.
     if np.min(arr) < 0 or np.max(arr) > 1.0:
         exps = np.exp(arr - np.max(arr))
         arr = exps / np.sum(exps)
@@ -254,6 +265,7 @@ def _predict_keras(bundle: dict[str, Any], image: Image.Image) -> np.ndarray:
         target_h = int(input_shape[1] or 224)
         target_w = int(input_shape[2] or 224)
 
+    # Match the model input size and use the common 0..1 normalization convention.
     image_resized = image.resize((target_w, target_h))
     arr = np.array(image_resized, dtype=np.float32) / 255.0
     arr = np.expand_dims(arr, axis=0)
@@ -266,6 +278,7 @@ def run_prediction(file_storage, model_meta: dict[str, str]):
     class_names: list[str] = bundle.get("class_names") or []
     image = preprocess_image(file_storage)
 
+    # Route prediction through the correct backend while keeping the response shape uniform.
     if bundle["kind"] == "transformers":
         probabilities = _predict_transformer(bundle, image)
     else:
@@ -289,6 +302,7 @@ def run_prediction(file_storage, model_meta: dict[str, str]):
 
 
 def get_feedback_mood(confidence: float) -> str:
+    # Drive the result-page visual state from the model confidence bucket.
     if confidence >= 80:
         return "win"
     if confidence >= 50:
@@ -332,6 +346,7 @@ def predict():
             image_preview = build_image_preview(file)
             result = run_prediction(file, selected_model)
         except Exception as exc:
+            # Surface inference problems in the UI instead of returning a raw server error.
             error = f"Prediction failed: {exc}"
 
     mood = "oops"
